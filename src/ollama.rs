@@ -19,6 +19,8 @@ pub struct Usage {
     pub models: Vec<(String, u64)>,
     /// which window `models` came from, e.g. "Weekly"
     pub models_window: Option<String>,
+    /// activity period description, e.g. "last 4 weeks (since 2026-08-31)"
+    pub period: Option<String>,
 }
 
 /// Capitalize a window name from the raw API ("weekly" → "Weekly").
@@ -85,7 +87,14 @@ fn window_models(w: &serde_json::Value) -> Vec<(String, u64)> {
     out
 }
 
-fn parse_usage(v: &serde_json::Value) -> (Vec<(String, f64)>, Vec<(String, u64)>, Option<String>) {
+fn parse_usage(
+    v: &serde_json::Value,
+) -> (
+    Vec<(String, f64)>,
+    Vec<(String, u64)>,
+    Option<String>,
+    Option<String>,
+) {
     let mut windows: Vec<(String, f64)> = Vec::new();
     let mut models_by_window: Vec<(String, Vec<(String, u64)>)> = Vec::new();
 
@@ -152,7 +161,25 @@ fn parse_usage(v: &serde_json::Value) -> (Vec<(String, f64)>, Vec<(String, u64)>
             models_window = Some("Last 4 weeks".into());
         }
     }
-    (windows, models, models_window)
+    // activity period: rolling window, described honestly (no fake countdown —
+    // `ending_at` tracks the fetch moment, not a fixed reset point)
+    let period = v
+        .get("activity")
+        .and_then(|a| a.get("period"))
+        .and_then(|p| p.as_object())
+        .map(|p| {
+            let kind = p
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("rolling")
+                .replace('_', " ");
+            match p.get("starting_at").and_then(|s| s.as_str()) {
+                Some(s) => format!("{kind} (since {})", &s[..10.min(s.len())]),
+                None => kind,
+            }
+        });
+
+    (windows, models, models_window, period)
 }
 
 /// Fetch usage for one API key from the official endpoint.
@@ -165,16 +192,17 @@ pub fn fetch_usage(key: &str) -> Usage {
     match resp {
         Ok(r) => match r.into_json::<serde_json::Value>() {
             Ok(v) => {
-                let (windows, models, models_window) = parse_usage(&v);
+                let (windows, models, models_window, period) = parse_usage(&v);
                 if windows.is_empty() {
                     Usage {
                         error: Some("no usage windows in response".into()),
                         windows,
                         models,
                         models_window,
+                        period,
                     }
                 } else {
-                    Usage { error: None, windows, models, models_window }
+                    Usage { error: None, windows, models, models_window, period }
                 }
             }
             Err(e) => Usage { error: Some(format!("bad JSON: {e}")), ..Default::default() },
@@ -233,39 +261,130 @@ where
 }
 
 /// Store -------------------------------------------------------------------
-
+///
+/// Secrets (API keys) live in the OS keyring — Windows Credential Manager or
+/// the freedesktop Secret Service on Linux. The JSON file stores only
+/// non-secret metadata (labels); the file is also the fallback when no
+/// keyring is available.
 #[derive(Serialize, Deserialize, Default)]
 pub struct KeyStore {
     pub keys: Vec<KeyEntry>,
 }
 
-impl KeyStore {
-    pub fn load() -> Self {
-        if let Some(path) = store_path() {
-            if let Ok(txt) = std::fs::read_to_string(&path) {
-                if let Ok(store) = serde_json::from_str(&txt) {
-                    return store;
+const SERVICE: &str = "ollama-shepherd";
+
+/// Read all keys: labels from the JSON file, secrets from the keyring.
+/// Falls back to a `key` field in the JSON (legacy plaintext store) when the
+/// keyring has no entry.
+pub fn load_keys() -> (Vec<KeyEntry>, Option<String>) {
+    let (mut store, warning) = load_store_with_backup();
+    for (i, k) in store.keys.iter_mut().enumerate() {
+        if k.key.is_empty() {
+            match keyring::Entry::new(SERVICE, &format!("key-{i}")) {
+                Ok(entry) => match entry.get_password() {
+                    Ok(secret) => k.key = secret,
+                    Err(_) => {} // stays empty; fetch will report the failure
+                },
+                Err(_) => {}
+            }
+        }
+    }
+    // legacy fallback: plaintext key fields from older versions
+    if store.keys.iter().all(|k| k.key.is_empty()) {
+        if let Some(path) = legacy_path() {
+            if let Ok(txt) = std::fs::read_to_string(path) {
+                if let Ok(legacy) = serde_json::from_str::<KeyStore>(&txt) {
+                    for (i, k) in legacy.keys.iter().enumerate() {
+                        if let Some(slot) = store.keys.get_mut(i) {
+                            if slot.key.is_empty() {
+                                slot.key = k.key.clone();
+                                migrate_to_keyring(i, &k.key);
+                            }
+                        }
+                    }
+                    save_store(&store);
                 }
             }
         }
-        Self::default()
     }
+    (store.keys, warning)
+}
 
-    pub fn save(&self) {
-        if let Some(path) = store_path() {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(json) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(path, json);
+fn migrate_to_keyring(index: usize, secret: &str) {
+    if let Ok(entry) = keyring::Entry::new(SERVICE, &format!("key-{index}")) {
+        let _ = entry.set_password(secret);
+    }
+}
+
+fn legacy_path() -> Option<std::path::PathBuf> {
+    home().map(|h| h.join(".ollama-shepherd").join("keys.json"))
+}
+
+fn home() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+}
+
+/// Load store from disk; on corrupt JSON, move it aside and return a warning.
+fn load_store_with_backup() -> (KeyStore, Option<String>) {
+    let path = match legacy_path() {
+        Some(p) => p,
+        None => return (KeyStore::default(), None),
+    };
+    let txt = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return (KeyStore::default(), None),
+    };
+    match serde_json::from_str::<KeyStore>(&txt) {
+        Ok(store) => (store, None),
+        Err(e) => {
+            let bak = path.with_extension("json.bak");
+            let note = if std::fs::rename(&path, &bak).is_ok() {
+                format!(
+                    "keys.json was corrupt (moved to {}) — re-add your keys. ({e})",
+                    bak.display()
+                )
+            } else {
+                format!("keys.json is corrupt and could not be backed up. ({e})")
+            };
+            (KeyStore::default(), Some(note))
+        }
+    }
+}
+
+fn save_store(store: &KeyStore) {
+    if let Some(path) = legacy_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(store) {
+            if std::fs::write(&path, json).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
             }
         }
     }
 }
 
-fn store_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(std::path::PathBuf::from)
-        .map(|h| h.join(".ollama-shepherd").join("keys.json"))
+/// Persist labels + write secrets to the keyring.
+pub fn save_keys(keys: &[KeyEntry]) {
+    let store = KeyStore {
+        keys: keys
+            .iter()
+            .map(|k| KeyEntry {
+                label: k.label.clone(),
+                key: String::new(), // never persist secrets to disk
+            })
+            .collect(),
+    };
+    save_store(&store);
+    for (i, k) in keys.iter().enumerate() {
+        if let Ok(entry) = keyring::Entry::new(SERVICE, &format!("key-{i}")) {
+            let _ = entry.set_password(&k.key);
+        }
+    }
 }

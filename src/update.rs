@@ -5,6 +5,7 @@
 //! (Windows trick: the running exe can be *renamed* but not overwritten,
 //! so we rename current → `.old`, put the new one in place, and exit.)
 
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -76,8 +77,8 @@ fn latest_release() -> Result<(String, String), String> {
     Ok((tag, download))
 }
 
-/// Stream a URL to a file.
-fn download(url: &str, dest: &std::path::Path) -> Result<(), String> {
+/// Stream a URL to a file, returning its SHA256 hex digest.
+fn download(url: &str, dest: &std::path::Path) -> Result<String, String> {
     let resp = ureq::get(url)
         .set("User-Agent", "ollama-shepherd-updater")
         .timeout(Duration::from_secs(300))
@@ -86,9 +87,33 @@ fn download(url: &str, dest: &std::path::Path) -> Result<(), String> {
     let mut reader = resp.into_reader();
     let mut file =
         std::fs::File::create(dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| format!("download failed: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("download failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("write failed: {e}"))?;
+    }
     file.flush().ok();
-    Ok(())
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Expected sha256 hex from the release's `<asset>.sha256` file.
+fn expected_checksum(url: &str) -> Option<String> {
+    let txt = ureq::get(&format!("{url}.sha256"))
+        .set("User-Agent", "ollama-shepherd-updater")
+        .timeout(Duration::from_secs(30))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    txt.split_whitespace().next().map(|s| s.to_lowercase())
 }
 
 fn exe_path() -> Result<PathBuf, String> {
@@ -142,7 +167,18 @@ pub fn run(check_only: bool) -> Result<(), String> {
     let stage = dir.join(format!(".shepherd-update-{uniq}"));
 
     println!("⇣ downloading {asset}…");
-    download(&url, &archive)?;
+    let got = download(&url, &archive)?;
+    if let Some(expected) = expected_checksum(&url) {
+        if got != expected {
+            let _ = std::fs::remove_file(&archive);
+            return Err(format!(
+                "checksum mismatch!\n  expected {expected}\n  got      {got}\n  aborting — nothing was changed"
+            ));
+        }
+        println!("🔒 checksum verified");
+    } else {
+        println!("⚠ could not fetch checksum file — installing unverified (sha256 {got})");
+    }
 
     // extract
     std::fs::create_dir_all(&stage).map_err(|e| format!("cannot stage: {e}"))?;

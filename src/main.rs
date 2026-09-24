@@ -1,7 +1,7 @@
 mod ollama;
 mod update;
 
-use ollama::{fetch_usage, pct, KeyEntry, KeyStore, Usage};
+use ollama::{fetch_usage, pct, KeyEntry, Usage};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -50,6 +50,8 @@ enum Msg {
 struct App {
     keys: Vec<KeyEntry>,
     usages: Vec<Usage>,
+    /// which keys currently have a fetch in flight
+    inflight: Vec<bool>,
     selected: usize,
     rx: std::sync::mpsc::Receiver<Msg>,
     outstanding: usize,
@@ -57,17 +59,26 @@ struct App {
     last_fetch: Option<Instant>,
     countdown: u64,
     editing: Option<String>,
+    startup_warning: Option<String>,
     /// false = overview (all keys), true = drill-in on selected key
     view: bool,
     quit: bool,
+    /// frame is only redrawn when something actually changed
+    dirty: bool,
 }
+
+/// Braille-ish spinner frames for in-flight keys.
+const SPINNER: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 impl App {
     fn new() -> (Self, Sender<Msg>) {
         let (tx, rx) = std::sync::mpsc::channel();
+        let (keys, warning) = ollama::load_keys();
+        let n = keys.len();
         let mut app = App {
-            keys: KeyStore::load().keys,
-            usages: Vec::new(),
+            keys,
+            usages: vec![Usage::default(); n],
+            inflight: vec![false; n],
             selected: 0,
             rx,
             outstanding: 0,
@@ -75,20 +86,24 @@ impl App {
             last_fetch: None,
             countdown: AUTO_SECS,
             editing: None,
+            startup_warning: warning,
             view: false,
             quit: false,
+            dirty: true,
         };
-        app.usages = vec![Usage::default(); app.keys.len()];
+        app.usages = vec![Usage::default(); n];
         (app, tx)
     }
 
+    /// Refresh: keeps old data on screen; only clears entries being refetched.
     fn start_fetch(&mut self, tx: &Sender<Msg>) {
         if self.fetching || self.keys.is_empty() {
             return;
         }
         self.fetching = true;
         self.outstanding = self.keys.len();
-        self.usages = vec![Usage::default(); self.keys.len()];
+        // mark all as in-flight but KEEP previous data visible until replaced
+        self.inflight = vec![true; self.keys.len()];
         for (i, k) in self.keys.iter().enumerate() {
             let key = k.key.clone();
             let tx = tx.clone();
@@ -97,6 +112,7 @@ impl App {
                 let _ = tx.send(Msg::Usage(i, u));
             });
         }
+        self.dirty = true;
     }
 
     fn drain(&mut self) {
@@ -107,9 +123,13 @@ impl App {
             match self.rx.try_recv() {
                 Ok(Msg::Usage(i, u)) => {
                     if i < self.usages.len() {
-                        self.usages[i] = u;
+                        self.usages[i] = u; // atomically replace one key's data
+                    }
+                    if i < self.inflight.len() {
+                        self.inflight[i] = false;
                     }
                     self.outstanding = self.outstanding.saturating_sub(1);
+                    self.dirty = true;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
@@ -118,11 +138,12 @@ impl App {
         if self.outstanding == 0 {
             self.fetching = false;
             self.last_fetch = Some(Instant::now());
+            self.dirty = true;
         }
     }
 
     fn save_keys(&self) {
-        KeyStore { keys: self.keys.clone() }.save();
+        ollama::save_keys(&self.keys);
     }
 }
 
@@ -180,21 +201,39 @@ fn run_app(
     app: &mut App,
     tx: &Sender<Msg>,
 ) -> io::Result<()> {
+    let mut spinner_frame: usize = 0;
+
     while !app.quit {
         app.drain();
 
+        // auto refresh countdown
         if !app.fetching {
             if let Some(last) = app.last_fetch {
-                app.countdown = AUTO_SECS.saturating_sub(last.elapsed().as_secs());
+                let elapsed = last.elapsed().as_secs();
+                let new_countdown = AUTO_SECS.saturating_sub(elapsed);
+                if new_countdown != app.countdown {
+                    app.countdown = new_countdown;
+                    app.dirty = true;
+                }
                 if app.countdown == 0 {
                     app.start_fetch(tx);
                 }
             }
         }
 
-        terminal.draw(|f| ui(f, app))?;
+        // redraw ONLY when something changed (no idle flicker)
+        if app.dirty {
+            app.dirty = false;
+            terminal.draw(|f| ui(f, app, spinner_frame))?;
+        }
 
-        if crossterm::event::poll(Duration::from_millis(100))? {
+        // wait for the next event; a short tick keeps the spinner alive mid-fetch
+        let timeout = if app.fetching {
+            Duration::from_millis(120) // spinner animation only while fetching
+        } else {
+            Duration::from_millis(500)
+        };
+        if crossterm::event::poll(timeout)? {
             match crossterm::event::read()? {
                 crossterm::event::Event::Key(key)
                     if key.kind == crossterm::event::KeyEventKind::Press =>
@@ -208,6 +247,10 @@ fn run_app(
                 }
                 _ => {}
             }
+        }
+
+        if app.fetching {
+            spinner_frame = (spinner_frame + 1) % SPINNER.len();
         }
     }
     Ok(())
@@ -224,9 +267,13 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent, tx: &Sender<Msg>) 
 
     if app.editing.is_some() {
         match key.code {
-            crossterm::event::KeyCode::Esc => app.editing = None,
+            crossterm::event::KeyCode::Esc => {
+                app.editing = None;
+                app.dirty = true;
+            }
             crossterm::event::KeyCode::Enter => {
                 let input = app.editing.take().unwrap_or_default();
+                app.dirty = true;
                 let input = input.trim().to_string();
                 if !input.is_empty() {
                     let (label, k) = match input.split_once(',') {
@@ -236,6 +283,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent, tx: &Sender<Msg>) 
                     if !k.is_empty() {
                         app.keys.push(KeyEntry { label, key: k });
                         app.usages.push(Usage::default());
+                        app.inflight.push(false);
                         app.selected = app.keys.len() - 1;
                         app.save_keys();
                         app.start_fetch(tx);
@@ -244,8 +292,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent, tx: &Sender<Msg>) 
             }
             crossterm::event::KeyCode::Backspace => {
                 app.editing.as_mut().unwrap().pop();
+                app.dirty = true;
             }
-            crossterm::event::KeyCode::Char(c) => app.editing.as_mut().unwrap().push(c),
+            crossterm::event::KeyCode::Char(c) => {
+                app.editing.as_mut().unwrap().push(c);
+                app.dirty = true;
+            }
             _ => {}
         }
         return;
@@ -256,17 +308,22 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent, tx: &Sender<Msg>) 
         crossterm::event::KeyCode::Esc => {
             if app.view {
                 app.view = false;
+                app.dirty = true;
             } else {
                 app.quit = true;
             }
         }
         crossterm::event::KeyCode::Char('r') => app.start_fetch(tx),
-        crossterm::event::KeyCode::Char('a') => app.editing = Some(String::new()),
+        crossterm::event::KeyCode::Char('a') => {
+            app.editing = Some(String::new());
+            app.dirty = true;
+        }
         crossterm::event::KeyCode::Char('d') => {
             if !app.keys.is_empty() {
                 let i = app.selected.min(app.keys.len() - 1);
                 app.keys.remove(i);
                 app.usages.remove(i);
+                app.inflight.remove(i);
                 if app.selected >= app.keys.len() {
                     app.selected = app.selected.saturating_sub(1);
                 }
@@ -274,32 +331,42 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent, tx: &Sender<Msg>) 
                 if app.keys.is_empty() {
                     app.view = false;
                 }
+                app.dirty = true;
             }
         }
         crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Tab => {
             if !app.keys.is_empty() {
                 app.selected = (app.selected + 1) % app.keys.len();
+                app.dirty = true;
             }
         }
         crossterm::event::KeyCode::Up => {
             if !app.keys.is_empty() {
                 app.selected = (app.selected + app.keys.len() - 1) % app.keys.len();
+                app.dirty = true;
             }
         }
         crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Right => {
             if !app.keys.is_empty() {
                 app.view = true;
+                app.dirty = true;
             }
         }
-        crossterm::event::KeyCode::Left => app.view = false,
-        crossterm::event::KeyCode::Char('v') => app.view = !app.view,
+        crossterm::event::KeyCode::Left => {
+            app.view = false;
+            app.dirty = true;
+        }
+        crossterm::event::KeyCode::Char('v') => {
+            app.view = !app.view;
+            app.dirty = true;
+        }
         _ => {}
     }
 }
 
 // ---------------------------------------------------------------- UI ----
 
-fn ui(f: &mut ratatui::Frame, app: &App) {
+fn ui(f: &mut ratatui::Frame, app: &App, spinner_frame: usize) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -309,14 +376,24 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(f.area());
 
-    header(f, app, outer[0]);
+    header(f, app, outer[0], spinner_frame);
+
+    if let Some(w) = &app.startup_warning {
+        let warn = Paragraph::new(Line::from(Span::styled(
+            format!(" ⚠ {w}"),
+            Style::new().fg(Color::Yellow),
+        )))
+        .block(Block::bordered());
+        let area = Rect { height: 3.min(outer[1].height), ..outer[1] };
+        f.render_widget(warn, area);
+    }
 
     if app.keys.is_empty() {
         empty_state(f, outer[1]);
     } else if app.view {
         detail(f, app, outer[1]);
     } else {
-        overview(f, app, outer[1]);
+        overview(f, app, outer[1], spinner_frame);
     }
 
     footer(f, outer[2]);
@@ -326,9 +403,12 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     }
 }
 
-fn header(f: &mut ratatui::Frame, app: &App, area: Rect) {
+fn header(f: &mut ratatui::Frame, app: &App, area: Rect, spinner_frame: usize) {
     let status = if app.fetching {
-        Span::styled("⟳ fetching…", Style::new().fg(Color::Yellow))
+        Span::styled(
+            format!("{} fetching…", SPINNER[spinner_frame % SPINNER.len()]),
+            Style::new().fg(Color::Yellow),
+        )
     } else if app.last_fetch.is_some() {
         Span::styled(format!("✓ auto-refresh in {}s", app.countdown), Style::new().fg(Color::Green))
     } else {
@@ -368,7 +448,7 @@ fn empty_state(f: &mut ratatui::Frame, area: Rect) {
 }
 
 /// Overview: one table with every key × every window + global model pie.
-fn overview(f: &mut ratatui::Frame, app: &App, area: Rect) {
+fn overview(f: &mut ratatui::Frame, app: &App, area: Rect, spinner_frame: usize) {
     // split: table on top, global pie below (pie hidden if too short)
     let show_pie = area.height >= 16;
     let parts = if show_pie {
@@ -384,9 +464,16 @@ fn overview(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let col_names = ollama::all_windows(app.usages.iter());
     let rows = app.keys.iter().zip(&app.usages).enumerate().map(|(i, (k, u))| {
         let sel = i == app.selected;
+        let inflight = app.inflight.get(i).copied().unwrap_or(false);
         let mut cells: Vec<Cell> = Vec::new();
+        // label cell carries the per-key spinner while in flight
+        let label_cell = if inflight {
+            format!("{} {}", SPINNER[spinner_frame % SPINNER.len()], display_label(k))
+        } else {
+            display_label(k)
+        };
         cells.push(
-            Cell::from(display_label(k)).style(
+            Cell::from(label_cell).style(
                 Style::new()
                     .fg(if sel { Color::Cyan } else { Color::White })
                     .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
@@ -405,10 +492,12 @@ fn overview(f: &mut ratatui::Frame, app: &App, area: Rect) {
                     .map(|(_, v)| pct(*v))
                     .unwrap_or((0.0, 100.0));
                 let col = tier(left).1;
-                cells.push(
-                    Cell::from(format!("{left:>5.1}%"))
-                        .style(Style::new().fg(col).add_modifier(Modifier::BOLD)),
-                );
+                // keep last value visible; dim it slightly while refetching
+                let mut style = Style::new().fg(col).add_modifier(Modifier::BOLD);
+                if inflight {
+                    style = style.add_modifier(Modifier::DIM);
+                }
+                cells.push(Cell::from(format!("{left:>5.1}%")).style(style));
             }
         }
         Row::new(cells).style(if sel { Style::new().bg(SEL_BG) } else { Style::new() })
@@ -449,7 +538,7 @@ fn overview(f: &mut ratatui::Frame, app: &App, area: Rect) {
     }
 }
 
-/// Drill-in: stacked gauges per window (monthly/weekly/session) + per-key pie.
+/// Drill-in: stacked gauges per window (weekly/session) + per-key pie + period.
 fn detail(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let i = app.selected.min(app.keys.len() - 1);
     let k = &app.keys[i];
@@ -508,6 +597,25 @@ fn detail(f: &mut ratatui::Frame, app: &App, area: Rect) {
                         }),
                 );
             f.render_widget(g, stack[idx]);
+        }
+        // activity period below the gauge stack
+        if let Some(p) = &u.period {
+            if let Some(last) = stack.last() {
+                let parea = Rect {
+                    y: last.y + last.height,
+                    height: 1.min(cols[0].height.saturating_sub(last.y + last.height - cols[0].y)),
+                    ..*last
+                };
+                if parea.height > 0 {
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            format!(" activity: {p}"),
+                            Style::new().fg(Color::DarkGray),
+                        ))),
+                        parea,
+                    );
+                }
+            }
         }
     }
 
