@@ -274,46 +274,47 @@ pub struct KeyStore {
 const SERVICE: &str = "ollama-shepherd";
 
 /// Read all keys: labels from the JSON file, secrets from the keyring.
-/// Falls back to a `key` field in the JSON (legacy plaintext store) when the
-/// keyring has no entry.
+/// Falls back to a `key` field in the JSON (legacy plaintext store) and
+/// migrates those into the keyring, then strips them from the file.
 pub fn load_keys() -> (Vec<KeyEntry>, Option<String>) {
     let (mut store, warning) = load_store_with_backup();
+
+    // 1) pull secrets from the keyring where the file has none
     for (i, k) in store.keys.iter_mut().enumerate() {
         if k.key.is_empty() {
-            match keyring::Entry::new(SERVICE, &format!("key-{i}")) {
-                Ok(entry) => match entry.get_password() {
-                    Ok(secret) => k.key = secret,
-                    Err(_) => {} // stays empty; fetch will report the failure
-                },
-                Err(_) => {}
-            }
-        }
-    }
-    // legacy fallback: plaintext key fields from older versions
-    if store.keys.iter().all(|k| k.key.is_empty()) {
-        if let Some(path) = legacy_path() {
-            if let Ok(txt) = std::fs::read_to_string(path) {
-                if let Ok(legacy) = serde_json::from_str::<KeyStore>(&txt) {
-                    for (i, k) in legacy.keys.iter().enumerate() {
-                        if let Some(slot) = store.keys.get_mut(i) {
-                            if slot.key.is_empty() {
-                                slot.key = k.key.clone();
-                                migrate_to_keyring(i, &k.key);
-                            }
-                        }
-                    }
-                    save_store(&store);
+            if let Ok(entry) = keyring::Entry::new(SERVICE, &format!("key-{i}")) {
+                if let Ok(secret) = entry.get_password() {
+                    k.key = secret;
                 }
             }
         }
     }
-    (store.keys, warning)
-}
 
-fn migrate_to_keyring(index: usize, secret: &str) {
-    if let Ok(entry) = keyring::Entry::new(SERVICE, &format!("key-{index}")) {
-        let _ = entry.set_password(secret);
+    // 2) legacy migration: file still carries plaintext keys → keyring,
+    //    then rewrite the file WITHOUT secrets (single pass, one condition)
+    let needs_migration = store.keys.iter().any(|k| !k.key.is_empty());
+    if needs_migration {
+        for (i, k) in store.keys.iter().enumerate() {
+            if !k.key.is_empty() {
+                if let Ok(entry) = keyring::Entry::new(SERVICE, &format!("key-{i}")) {
+                    let _ = entry.set_password(&k.key);
+                }
+            }
+        }
+        // strip secrets from the on-disk store
+        let cleaned = KeyStore {
+            keys: store
+                .keys
+                .iter()
+                .map(|k| KeyEntry { label: k.label.clone(), key: String::new() })
+                .collect(),
+        };
+        save_store(&cleaned);
+        // keep secrets in memory for this session
+        store.keys = store.keys.clone();
     }
+
+    (store.keys, warning)
 }
 
 fn legacy_path() -> Option<std::path::PathBuf> {
