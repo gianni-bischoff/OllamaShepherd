@@ -21,6 +21,29 @@ monthly), plus braille pie charts of your model request distribution.
 
 ## Install
 
+### One-liner
+
+**Linux (x86_64):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gianni-bischoff/OllamaShepherd/master/install.sh | bash
+```
+
+Installs to `~/.local/bin` (override with `INSTALL_DIR=/usr/local/bin`). Requires `curl`, `tar`, `sha256sum`.
+
+**Windows (x86_64, PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/gianni-bischoff/OllamaShepherd/master/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\Programs\ollama-shepherd` and adds it to your user PATH
+(override with `$env:SHEPHERD_DEST = "D:\Bin"` before piping).
+
+Both scripts download the latest release, **verify the SHA256 checksum**, install the binary and tell you how to run it. To pin a version: `VERSION=v0.2.2` (Linux) / `$env:SHEPHERD_VERSION="v0.2.2"` (Windows).
+
+### Manual
+
 Grab the archive for your platform from the
 [latest release](https://github.com/gianni-bischoff/OllamaShepherd/releases/latest),
 extract it and put the binary somewhere in your `PATH` (e.g. `D:\Bin`).
