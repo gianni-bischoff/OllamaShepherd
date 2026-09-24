@@ -133,7 +133,12 @@ pub fn run(check_only: bool) -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let archive = dir.join(format!(".shepherd-update-{uniq}.pkg"));
+    // Windows' Expand-Archive insists on a .zip extension.
+    let archive = if cfg!(target_os = "windows") {
+        dir.join(format!(".shepherd-update-{uniq}.zip"))
+    } else {
+        dir.join(format!(".shepherd-update-{uniq}.pkg"))
+    };
     let stage = dir.join(format!(".shepherd-update-{uniq}"));
 
     println!("⇣ downloading {asset}…");

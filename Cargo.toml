@@ -1,6 +1,6 @@
 [package]
 name = "ollama-shepherd"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "TUI dashboard for Ollama Cloud subscription usage across multiple API keys"
 authors = ["Gianni"]
