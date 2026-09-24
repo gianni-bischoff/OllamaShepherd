@@ -4,6 +4,8 @@ A terminal dashboard for monitoring **Ollama Cloud** subscription usage across
 **multiple API keys** — percentage remaining per usage window (session / weekly /
 monthly), plus braille pie charts of your model request distribution.
 
+![Ollama Shepherd screenshot](assets/screenshot.png)
+
 ![status](https://img.shields.io/badge/platform-windows%20%7C%20linux-blue) ![status](https://img.shields.io/badge/license-MIT-green)
 
 ## Features

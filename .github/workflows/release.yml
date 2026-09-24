@@ -50,9 +50,7 @@ jobs:
       - name: Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../${{ matrix.archive }} ollama-shepherd
-          cd ../..
+          tar czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release ollama-shepherd
           sha256sum ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
 
       - name: Package (Windows)
